@@ -1,0 +1,625 @@
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_NAME="${1:-b2b-web3-rpc-service}"
+REPO_DESC="${2:-Enterprise Web3 RPC Service with Admin}"
+VISIBILITY="${3:-private}" # private or public
+GITHUB_ORG="${4:-}" # optional
+REGISTRY_CHOICE="${5:-ghcr}" # ghcr or dockerhub (optional for CI setup)
+
+# Prereqs check
+if ! command -v gh >/dev/null 2>&1; then
+  echo "Error: gh CLI not found. Install and authenticate first."
+  exit 1
+fi
+if ! command -v git >/dev/null 2>&1; then
+  echo "Error: git not found. Install git first."
+  exit 1
+fi
+
+# --- Project scaffold (minimal safe scaffold if files missing) ---
+# Create basic structure only if not present
+[ -d src ] || mkdir -p src
+[ -d frontend-admin ] || mkdir -p frontend-admin/src
+[ -d prisma ] || mkdir -p prisma
+[ -d deploy ] || mkdir -p deploy
+
+# .gitignore
+cat > .gitignore <<'GITIGNORE'
+node_modules
+dist
+.env
+.env.local
+.DS_Store
+coverage
+.vscode
+GITIGNORE
+
+# .env.example
+cat > .env.example <<'ENVEX'
+PORT=3000
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/b2b_web3
+REDIS_URL=redis://localhost:6379
+JWT_ACCESS_SECRET=change_this_access_secret
+JWT_REFRESH_SECRET=change_this_refresh_secret
+ALCHEMY_ETHEREUM_URL=
+INFURA_ETHEREUM_URL=
+TRONGRID_URL=https://api.trongrid.io
+TRONGRID_API_KEY=
+ENVEX
+
+# package.json
+cat > package.json <<'PKG'
+{
+  "name": "b2b-web3-rpc-service",
+  "version": "1.0.0",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate deploy"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.0",
+    "dotenv": "^16.0.0",
+    "ethers": "^6.0.0",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.0",
+    "prisma": "^5.0.0",
+    "@prisma/client": "^5.0.0",
+    "tronweb": "^4.0.0",
+    "ioredis": "^5.0.0",
+    "pino": "^8.0.0"
+  },
+  "devDependencies": {
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.0.0",
+    "@types/express": "^4.17.17",
+    "@types/node": "^20.0.0"
+  }
+}
+PKG
+
+# tsconfig.json
+cat > tsconfig.json <<'TSC'
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "CommonJS",
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "typeRoots": ["./node_modules/@types", "./src/types"]
+  },
+  "include": ["src/**/*"]
+}
+TSC
+
+# prisma/schema.prisma (minimal)
+cat > prisma/schema.prisma <<'PRISMA'
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id         String   @id @default(uuid())
+  email      String   @unique
+  password   String
+  name       String?
+  role       Role     @default(USER)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  isActive   Boolean  @default(true)
+}
+
+model RpcProvider {
+  id         String   @id @default(uuid())
+  name       String
+  chain      String
+  url        String
+  apiKey     String?
+  priority   Int      @default(0)
+  enabled    Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+enum Role {
+  ADMIN
+  MANAGER
+  USER
+}
+PRISMA
+
+# Dockerfile.backend
+cat > Dockerfile.backend <<'DOCKB'
+FROM node:18-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --production
+COPY . .
+RUN npm run build
+EXPOSE 3000
+CMD ["node", "dist/server.js"]
+DOCKB
+
+# frontend Dockerfile
+cat > frontend-admin/Dockerfile.frontend <<'DOCKF'
+FROM node:18-alpine
+WORKDIR /app
+COPY frontend-admin/package*.json ./
+RUN npm ci
+COPY frontend-admin .
+CMD ["npm", "run", "dev"]
+DOCKF
+
+# docker-compose.yml
+cat > docker-compose.yml <<'DC'
+version: '3.8'
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: b2b_web3
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    env_file:
+      - .env
+    ports:
+      - "3000:3000"
+    depends_on:
+      - postgres
+      - redis
+
+  frontend:
+    build:
+      context: ./frontend-admin
+      dockerfile: Dockerfile.frontend
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
+DC
+
+# setup.sh
+cat > setup.sh <<'SETUP'
+#!/usr/bin/env bash
+set -euo pipefail
+[ -f .env ] || cp .env.example .env
+docker-compose up -d postgres redis
+echo "Waiting for Postgres..."
+until docker exec $(docker-compose ps -q postgres) pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
+npm ci
+npx prisma generate || true
+npx prisma migrate deploy || true
+cd frontend-admin || exit 0
+npm ci || true
+npm run build || npm run dev --if-present || true
+cd -
+docker-compose up -d --build backend frontend || true
+echo "Seeding admin user..."
+node -e "const { PrismaClient } = require('@prisma/client'); const bcrypt = require('bcrypt'); (async()=>{ const prisma=new PrismaClient(); const email='admin@example.com'; const existing=await prisma.user.findUnique({where:{email}}); if(!existing){ const hashed=await bcrypt.hash('Admin123!',12); await prisma.user.create({data:{email,password:hashed,name:'Admin',role:'ADMIN'}}); console.log('Seeded admin user'); } else console.log('Admin exists'); await prisma.$disconnect(); })();"
+SETUP
+chmod +x setup.sh
+
+# minimal src files
+mkdir -p src/modules/auth src/modules/web3 src/middlewares src/utils src/types
+cat > src/server.ts <<'SERVER'
+import dotenv from 'dotenv';
+dotenv.config();
+import express from 'express';
+const app = express();
+app.use(express.json());
+app.get('/healthz', (_req, res) => res.json({ status: 'ok' }));
+app.listen(process.env.PORT || 3000, ()=>console.log('Server running'));
+SERVER
+
+cat > src/utils/jwt.ts <<'JWT'
+import jwt from 'jsonwebtoken';
+export function signAccessToken(payload: object){ return jwt.sign(payload, process.env.JWT_ACCESS_SECRET||'access-secret',{expiresIn:'15m'}); }
+export function verifyAccessToken(token: string){ return jwt.verify(token, process.env.JWT_ACCESS_SECRET||'access-secret'); }
+JWT
+
+# deploy manifests (placeholders)
+cat > deploy/backend-deployment.yaml <<'YAML'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web3-backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web3-backend
+  template:
+    metadata:
+      labels:
+        app: web3-backend
+    spec:
+      containers:
+        - name: backend
+          image: __BACKEND_IMAGE__
+          ports:
+            - containerPort: 3000
+          envFrom:
+            - secretRef:
+                name: web3-env-secret
+YAML
+
+cat > deploy/backend-service.yaml <<'YAML'
+apiVersion: v1
+kind: Service
+metadata:
+  name: web3-backend-svc
+spec:
+  selector:
+    app: web3-backend
+  ports:
+    - port: 3000
+      targetPort: 3000
+  type: ClusterIP
+YAML
+
+cat > deploy/frontend-deployment.yaml <<'YAML'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web3-frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web3-frontend
+  template:
+    metadata:
+      labels:
+        app: web3-frontend
+    spec:
+      containers:
+        - name: frontend
+          image: __FRONTEND_IMAGE__
+          ports:
+            - containerPort: 5173
+YAML
+
+cat > deploy/frontend-service.yaml <<'YAML'
+apiVersion: v1
+kind: Service
+metadata:
+  name: web3-frontend-svc
+spec:
+  selector:
+    app: web3-frontend
+  ports:
+    - port: 80
+      targetPort: 5173
+  type: LoadBalancer
+YAML
+
+cat > deploy/postgres-statefulset.yaml <<'YAML'
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: web3-postgres
+spec:
+  selector:
+    matchLabels:
+      app: web3-postgres
+  serviceName: "web3-postgres-svc"
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: web3-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:15
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: web3-env-secret
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: web3-env-secret
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: web3-env-secret
+                  key: POSTGRES_DB
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web3-postgres-svc
+spec:
+  selector:
+    app: web3-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+  type: ClusterIP
+YAML
+
+cat > deploy/redis-deployment.yaml <<'YAML'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web3-redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web3-redis
+  template:
+    metadata:
+      labels:
+        app: web3-redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7
+          ports:
+            - containerPort: 6379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web3-redis-svc
+spec:
+  selector:
+    app: web3-redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+  type: ClusterIP
+YAML
+
+cat > deploy/ingress.yaml <<'YAML'
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web3-ingress
+  annotations:
+    kubernetes.io/ingress.class: nginx
+spec:
+  rules:
+    - host: yourdomain.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web3-frontend-svc
+                port:
+                  number: 80
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: web3-backend-svc
+                port:
+                  number: 3000
+YAML
+
+# --- Git init / commit ---
+if [ ! -d .git ]; then
+  git init
+  git add .
+  git commit -m "Initial scaffold"
+else
+  git add .
+  git commit -m "Prepare repo for GitHub and ZIP" || true
+fi
+
+# --- Create GitHub repo ---
+if [ -n "$GITHUB_ORG" ]; then
+  gh repo create "$GITHUB_ORG/$REPO_NAME" --"$VISIBILITY" --description "$REPO_DESC" --confirm
+  REMOTE="git@github.com:$GITHUB_ORG/$REPO_NAME.git"
+else
+  gh repo create "$REPO_NAME" --"$VISIBILITY" --description "$REPO_DESC" --confirm
+  REMOTE="git@github.com:$(gh api user --jq .login)/$REPO_NAME.git"
+fi
+
+git remote add origin "$REMOTE" 2>/dev/null || git remote set-url origin "$REMOTE"
+git branch -M main
+git push -u origin main --force
+
+# --- Create CI workflow ---
+mkdir -p .github/workflows
+cat > .github/workflows/ci-deploy.yml <<'YML'
+name: Build Push Deploy
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_TAG: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to registry (GHCR)
+        if: ${{ secrets.REGISTRY == 'ghcr' }}
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GHCR_USERNAME }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Login to DockerHub
+        if: ${{ secrets.REGISTRY == 'dockerhub' }}
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push backend image
+        run: |
+          IMAGE="${{ secrets.REGISTRY_HOST }}/${{ secrets.REGISTRY_USER }}/b2b-web3-backend:${{ env.IMAGE_TAG }}"
+          docker build -t "$IMAGE" -f Dockerfile.backend .
+          docker push "$IMAGE"
+        env:
+          DOCKER_BUILDKIT: 1
+
+      - name: Build and push frontend image
+        run: |
+          IMAGE="${{ secrets.REGISTRY_HOST }}/${{ secrets.REGISTRY_USER }}/b2b-web3-frontend:${{ env.IMAGE_TAG }}"
+          docker build -t "$IMAGE" -f frontend-admin/Dockerfile.frontend frontend-admin
+          docker push "$IMAGE"
+        env:
+          DOCKER_BUILDKIT: 1
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Restore kubeconfig
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_BASE64 }}" | base64 --decode > kubeconfig
+          export KUBECONFIG=$PWD/kubeconfig
+          kubectl config view
+      - name: Apply manifests
+        run: |
+          export KUBECONFIG=$PWD/kubeconfig
+          sed -i "s|__BACKEND_IMAGE__|${{ secrets.REGISTRY_HOST }}/${{ secrets.REGISTRY_USER }}/b2b-web3-backend:${{ github.sha }}|g" deploy/backend-deployment.yaml
+          sed -i "s|__FRONTEND_IMAGE__|${{ secrets.REGISTRY_HOST }}/${{ secrets.REGISTRY_USER }}/b2b-web3-frontend:${{ github.sha }}|g" deploy/frontend-deployment.yaml
+          kubectl apply -f deploy/postgres-statefulset.yaml
+          kubectl apply -f deploy/redis-deployment.yaml
+          kubectl apply -f deploy/backend-deployment.yaml
+          kubectl apply -f deploy/backend-service.yaml
+          kubectl apply -f deploy/frontend-deployment.yaml
+          kubectl apply -f deploy/frontend-service.yaml
+          kubectl apply -f deploy/ingress.yaml
+YML
+
+git add .github/workflows/ci-deploy.yml
+git commit -m "Add CI/CD workflow" || true
+git push origin main || true
+
+# --- Configure GitHub secrets (interactive) ---
+GH_USER="$(gh api user --jq .login)"
+echo "Configuring GitHub secrets for repository: ${GH_USER}/${REPO_NAME}"
+
+if [ "$REGISTRY_CHOICE" = "ghcr" ]; then
+  REG_HOST="ghcr.io"
+  REG_USER="$GH_USER"
+  read -s -p "Enter GHCR token (PAT with packages:write and repo scopes): " GHCR_TOKEN
+  echo
+  gh secret set REGISTRY --body "ghcr"
+  gh secret set REGISTRY_HOST --body "$REG_HOST"
+  gh secret set REGISTRY_USER --body "$REG_USER"
+  gh secret set GHCR_USERNAME --body "$GH_USER"
+  gh secret set GHCR_TOKEN --body "$GHCR_TOKEN"
+else
+  if [ -z "${DOCKER_USER:-}" ]; then
+    read -p "Enter DockerHub username: " DOCKER_USER
+  fi
+  read -s -p "Enter DockerHub token/password: " DOCKERHUB_TOKEN
+  echo
+  gh secret set REGISTRY --body "dockerhub"
+  gh secret set REGISTRY_HOST --body "docker.io"
+  gh secret set REGISTRY_USER --body "$DOCKER_USER"
+  gh secret set DOCKERHUB_USERNAME --body "$DOCKER_USER"
+  gh secret set DOCKERHUB_TOKEN --body "$DOCKERHUB_TOKEN"
+fi
+
+# kubeconfig secret
+if command -v kubectl >/dev/null 2>&1 && kubectl config view >/dev/null 2>&1; then
+  KCFG_PATH="${KUBECONFIG:-$HOME/.kube/config}"
+  KCFG_B64=$(base64 -w0 < "$KCFG_PATH")
+  gh secret set KUBE_CONFIG_BASE64 --body "$KCFG_B64"
+else
+  echo "kubectl not configured locally or kubeconfig not found."
+  echo "If you want to add kubeconfig secret now, paste base64-encoded kubeconfig (or press Enter to skip):"
+  read -r KCFG_B64_INPUT
+  if [ -n "$KCFG_B64_INPUT" ]; then
+    gh secret set KUBE_CONFIG_BASE64 --body "$KCFG_B64_INPUT"
+  fi
+fi
+
+# set DB secrets from .env if present
+if [ -f .env ]; then
+  POSTGRES_USER=$(grep -E '^POSTGRES_USER=' .env | cut -d'=' -f2- || echo postgres)
+  POSTGRES_PASSWORD=$(grep -E '^POSTGRES_PASSWORD=' .env | cut -d'=' -f2- || echo postgres)
+  POSTGRES_DB=$(grep -E '^POSTGRES_DB=' .env | cut -d'=' -f2- || echo b2b_web3)
+  gh secret set POSTGRES_USER --body "$POSTGRES_USER"
+  gh secret set POSTGRES_PASSWORD --body "$POSTGRES_PASSWORD"
+  gh secret set POSTGRES_DB --body "$POSTGRES_DB"
+fi
+
+# --- Create ZIP archive ---
+ZIP_NAME="${REPO_NAME}.zip"
+echo "Creating ZIP archive: $ZIP_NAME"
+git archive -o "$ZIP_NAME" HEAD || zip -r "$ZIP_NAME" . -x .git\* node_modules\* dist\* "*.env" "*.env.local" .DS_Store || true
+
+echo "Done."
+echo " - ZIP: $(pwd)/$ZIP_NAME"
+echo " - Repo: $REMOTE"
+echo " - CI workflow added: .github/workflows/ci-deploy.yml"
+```
